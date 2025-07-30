@@ -1,0 +1,605 @@
+---
+title: "Bayesian Modelling Project"
+author: "Matteo Vantaggio"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+
+```{r include=FALSE}
+library(dplyr)
+library(mvgam)
+library(cmdstanr)
+library(tidyr)
+library(ggplot2)
+library(corrplot)
+library(zoo)
+library(bayesplot)
+library(patchwork)
+library(marginaleffects)
+library(mgcv)
+library(gratia)
+library(loo)
+```
+
+## DESCRIPTION OF THE DATA
+```{r include=FALSE}
+load('C:/Users/matte/Documents/R/BAYESIAN/mvgam_progetto/nicholasjclark-mvgam-748a46a/data/portal_data.rda')
+portal <- portal_data
+glimpse(portal)
+```
+The dataset contain four different rodent species and their respective count which will be our response variable we would like to model and forecast. Each of the four species time series contains the number of rodent captures made each lunar month (which is approximately 29 days long) from 2004 to 2020.
+Since modelling 4 time series simultaneously can quickly become cumbersome, we will limit ourselves to modeling only one species of the four available.
+```{r include=FALSE}
+portal %>%
+  select(moon, PP, DM, DO, OT, year, month, mintemp, ndvi) -> portal
+```
+
+
+```{r}
+summary(portal)
+```
+We will focus the analysis on time series of captures for one specific rodent species, the desert pocket Mouse Chaetodipus Penicillatus.
+The desert pocket mouse is a small rodent species adapted to the arid regions of the southwestern United States and northern Mexico. They are known for their burrowing behavior, seed caching, and ability to survive with minimal water intake. 
+A notable characteristic of C. penicillatus is its ability to enter a state of torpor during colder months, leading to significantly reduced activity and lower capture rates in winter.
+
+## PREPROCESSING AND EDA
+Converting the dataset to a long format dataset. This step is necessary because the mvgam package uses this type of format where there is a series column containing all available series (just one in our case); a time variable which in our case corresponds to the month column, rescaled such that it starts from 1; 
+```{r}
+portal %>%
+  mutate(time = moon - (min(moon)) + 1) %>%  # e.g. 329 - 329 + 1
+  mutate(count = PP) %>%
+  mutate(series = as.factor('PP')) %>%
+  select(series, year, time, count, mintemp, ndvi) -> model_data
+
+head(model_data)
+summary(model_data)
+```
+The response variable represents the number of PP captured, so it is bounded by non-negative values. As we can see, there are 36 NA's (missing values) in the response variable. In most traditional time series models, this would pose a problem, and we would need to find a way to impute those missing values. However, for the models applied using the mvgam package, this is not an issue.
+
+
+We can observe some seasonality in the top-left graph, which is confirmed by the ACF plot in the bottom-left. Additionally, missing values are evident in the response variable "count."
+```{r}
+plot_mvgam_series(data = model_data, series = 1, y = 'count')
+```
+
+We can also look at the plot of partial autocorrelation function.
+```{r}
+pacf(model_data$ndvi, na.action = na.pass, main = "PACF of Count")
+```
+
+As suggested by the histogram above, data are not symmetric. With a standard Shapiro-Wilk test we can assess whether or not data distribute normally. Given the low p-value, we can reject the null hypothesis of normality.
+```{r}
+shapiro.test(model_data$count)
+```
+Here we can visualize the correlation among predictors and covariates.
+```{r}
+numeric_vars <- model_data[, c("count", "mintemp", "ndvi")]
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+corrplot(cor_matrix, method = "circle")
+```
+
+Fitting a *loess* curve is useful for capturing potential non-linearities. From the two plots below we can see some nonlinear patterns, although not very strong.
+```{r}
+ggplot(model_data, aes(x = mintemp, y = count)) +
+  geom_point(color = "steelblue", alpha = 0.6) +
+  geom_smooth(method = "loess", color = "darkred", se = TRUE) +
+  labs(title = ,
+       x = "Minimum Temperature", y = "Count") +
+  theme_minimal()
+```
+
+```{r}
+
+ggplot(model_data, aes(x = ndvi, y = count)) +
+  geom_point(color = "forestgreen", alpha = 0.6) +
+  geom_smooth(method = "loess", color = "darkred", se = TRUE) +
+  labs(title = ,
+       x = "NDVI", y = "Count") +
+  theme_minimal()
+```
+
+Given the non-Gausssian data, missing values, possibly measurement errors and non-linearities, we should move away from linear models. 
+
+## MODEL FITTING
+```{r include=FALSE}
+model_data %>%
+  mutate(year_fac = factor(year)) -> model_data
+
+glimpse(model_data)
+
+```
+The first fitted model is a hierarchical GLM.
+This model is just a starting point to explore whether we can explain the number of captures by differences between years.
+The number of rodent captures is assumed to follow a Poisson distribution (though we will tackle this assumption in more details later on), which sounds like a natural choice for non-negative count data as the Poisson models the probability of a certain number of events happening in a fixed time period.
+The model uses a log link function which ensures that predictions are non-negative. 
+Then we have random (hierarchical) intercepts for the year factor which highlights the prior idea that although each year's effect has unique characteristics (because different environmental conditions might affect rodent captures in each year), we believe that these yearly effects are not completely independent, but rather all sampled from the same underlying population. There is kind of a underlying connection between years, so that the information learned about one year could inform the expected number of captures in another.
+
+```{r echo=TRUE}
+ggplot(model_data, aes(x = factor(year), y = count)) +
+  geom_boxplot(fill = "grey", color = "darkred", 
+               outlier.shape = NA, 
+               width = 0.7) +       
+  stat_boxplot(geom = "errorbar", width = 0.3, color = "darkred") + 
+  labs(title = "Boxplot of Yearly Rodent Counts",
+       x = "Year",
+       y = "Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+In order to produce out of sample predictions, we need to divide the dataset into training and testing. The first 160 observations will be used for training the models, the left part to make predictions.
+```{r}
+model_data %>% 
+  dplyr::filter(time <= 160) -> data_train 
+model_data %>% 
+  dplyr::filter(time > 160) -> data_test
+```
+
+Before actually running the sampler we can take a look at the priors the function will use in this situation and we can edit them to represent our own prior beliefs, if any. 
+```{r}
+priors <- get_mvgam_priors(count ~ s(year_fac, bs = 're')-1,
+                  family = poisson(),
+                  data = model_data)
+priors
+```
+
+
+```{r}
+model_re <- mvgam(count ~ s(year_fac, bs = 're')-1,
+                  family = poisson(),
+                  data = data_train,
+                  newdata = data_test)
+```
+
+\[
+Y_t \sim \text{Poisson}(\lambda_t)
+\]
+\[
+\log(\lambda_t) = \beta_{\text{year}[t]}
+\]
+\[
+\beta_{\text{year}} \sim \text{Normal}(\mu_{\text{year}}, \sigma_{\text{year}})
+\]
+\[
+\mu_{\text{year}} \sim \text{Normal}(0, 1)
+\]
+
+\[
+\sigma_{\text{year}} \sim \text{Exponential}(2)
+\]
+```{r}
+summary(model_re)
+```
+
+Using the 'code' function, the Stan code is displayed.
+```{r}
+code(model_re)
+```
+
+We can extract the posterior samples of the mean and standard deviation of population-level effects.
+```{r}
+pop_params <- as.data.frame(model_re, 
+                            variable = c('mean(year_fac)',
+                                         'sd(year_fac)'))
+head(pop_params)
+```
+
+As we said before, in this model, each year has its own random effect, meaning that the effect of each year on the number of rodent captures is modeled as a deviation from an overall population level-mean. The posterior distribution of mean(year_fac) consists of samples from the model's estimate of $\mu_{\text{year}}$, the population mean of the year effects. The mean of these posterior samples gives us the model's best estimate of the overall baseline effect of years on rodent captures.
+Similarly, the mean of *sd(year_fac)* posterior samples represents the average spread of year-specifc random effects around the population-level mean.
+The two results shown below are on the link scale. In order to be more interpretable we can turn them into the response scale
+```{r}
+# link scale
+mean(pop_params[,1])
+mean(pop_params[,2])
+
+# response scale
+mean(exp(pop_params[,1]))
+mean(exp(pop_params[,2]))
+```
+
+In order to account for the uncertainty in the estimation we can build and visualize 95% credible intervals of posterior samples.
+```{r}
+mean_year_ci <- quantile(pop_params$`mean(year_fac)`, probs = c(0.025, 0.975))
+sd_year_ci <- quantile(pop_params$`sd(year_fac)`, probs = c(0.025, 0.975))
+
+
+# plot as histograms
+hist(pop_params$`mean(year_fac)`, main = expression(mu[year]), col = "darkred", breaks = 20)
+abline(v = mean_year_ci, col = "blue", lwd = 2, lty = 2)
+hist(pop_params$`sd(year_fac)`, main = expression(sigma[year]), col = "darkred", breaks = 20)
+abline(v = sd_year_ci, col = "blue", lwd = 2, lty = 2)
+```
+
+## ASSESSING GOODNESS OF FIT
+Among different ways of assessing goodness of fit, a natural one is to compare observed and expected frequencies from the model. A very useful tool in case of non-negative count data is the **rootogram**, which plots "histogram-like bars for the observed frequencies and a curve for the fitted frequencies, all on a square-root scale [...] to approximately adjust for scale differences across the values" (*Kleiber-Zeileis, 2016*). If the bars deviate from the curve (either above or below), it indicates areas where what the model expects does not align with the observed data.
+```{r}
+pp_check(object = model_re, type = 'rootogram')
+```
+
+To see whether these yearly intercepts can result in good time-varying predictions, we can plot forecasts, which show that the model is not capable of producing accurate predictions.
+```{r}
+plot(model_re, type = 'forecast')
+```
+
+It is evident that there is a substantial amount of variability that remains unexplained.
+Let us now examine the residuals: as we can see, there is a strong autocorrelation in the residuals which  means the model is not capturing the time-dependent structure in the data. 
+In this case, the model may need to incorporate more complex components.
+```{r}
+plot(model_re, type = "residuals")
+```
+## Theoretic detour
+We will now move from the hierarchical GLM formulation to the use of GAMs. While with GLMs we assume linear relationships in the parameters, GAMs relax this assumption and deal with non-linearities in the data.
+A Generalized Additive Model can be represented as a sum of smooth functions, named splines, representing functional relationships between covariates and the response:
+$$
+E(Y|X) = g^{-1} (\beta_0 + \sum_{i=1}^{I} s_i(x_i))
+$$
+Splines are composed of simpler functions named *basis functions*. In particular, they are sums of weighted basis functions evaluated at the values of *x*:
+$$
+s(x) = \sum_{k = 1}^{K}\beta_kb_k(x)
+$$
+In the frequentist framework, the $\beta_k$ are estimated by starting off with the basis functions that are unweighted and values for those weights are chosen so to maximize the penalized log-likelihood, namely we force the spline to go as close to the data as we can with the caveat that we don't want to overfit. In order to avoid overfitting our data we measure the wiggliness of the fitted function: the more the fitted function deviates from a flat line (unweighted basis functions), the more complicated that model is.
+One straightforward measure for that is the following,
+$$
+\int_\mathbb{R}[s'']^2dx = \beta^TS\beta=W
+$$
+namely the integrated square second derivative of the smooth function, which can be written as a function of the estimated coefficients $\beta$ for the basis functions and *S* which is the penalty matrix.
+We want to penalize *W* to avoid overfitting using a *smoothing parameter* $\lambda$:
+$$
+\mathcal{L}_{pen} = log(Likelihood) - \lambda W
+$$
+If we set $\lambda$ to 0 we are fitting an unpenalized model, but if we allow it to be very large we are going to pay an increasing cost for the wiggliness and so the model will tend towards the linear model.
+
+In the Bayesian framework the focus shifts from finding a single best set of coefficients to treating the coefficients as random variables drawn from a multivariate Gaussian distribution with the penalty acting on the prior precision:
+a large $\lambda$ results in a tight prior, while a smaller one allows for more wiggliness as the prior imposes less constraints on the coefficients.
+
+
+## BACK TO MODELLING
+In order to improve model's performances we can replace the year variable with the time variable, hoping that temporal dependencies will be better captured.
+Here we can see what 15 basis functions look like using B-splines. The larger k is, the more complex the model will be.
+```{r}
+basis_funs <- basis(s(time, bs = 'bs', k = 15), 
+                            data = model_data)
+draw(basis_funs) +
+  labs(y = 'Basis function value', x = 'Time')
+```
+
+These are the priors that mvgam would use for this setting, but we can decide to place Standard Normal priors on fixed effects coefficients 
+```{r}
+get_mvgam_priors(count ~ s(time, bs = 'bs', k = 15)+
+                       mintemp + ndvi,
+                     family = poisson(),
+                     data = data_train)
+```
+
+```{r}
+time_smooth <- mvgam(count ~ s(time, bs = 'bs', k = 15)+
+                       mintemp + ndvi,
+                     family = poisson(),
+                     data = data_train,
+                     newdata = data_test,
+                     priors = prior(normal(0, 1), class = b))
+```
+
+\[
+\text{count}_t \sim \text{Poisson}(\lambda_t)
+\]
+
+\[
+\log(\lambda_t) = \beta_0 + s(\text{time})_t + \beta_{\text{ndvi}} \cdot \text{ndvi}_t + \beta_{\text{mintemp}} \cdot \text{mintemp}_t 
+\]
+
+\[
+\beta_0 \sim \text{Student}(3, 2.6, 2.5)
+\]
+
+\[
+s(\text{time})_t = \sum_{k=1}^{K} b_k \cdot \beta_{\text{smooth}}
+\]
+
+\[
+\beta_{\text{smooth}} \sim \text{MVNormal}(0, (S \cdot \lambda)^{-1})
+\]
+
+\[
+\beta_{\text{ndvi}} \sim \text{Normal}(0, 1)
+\]
+
+\[
+\beta_{\text{mintemp}} \sim \text{Normal}(0, 1)
+\]
+
+
+
+
+
+As we can see from the plots below, the residuals still show autocorrelation, meaning also the GAM is not able to capture the temporal structure of the data...
+```{r}
+plot(time_smooth, type = 'residuals')
+```
+
+...which is confirmed by the bad forecasts.
+```{r}
+plot(time_smooth, type = 'forecast')
+```
+
+One key aspect that drives the forecasts is the choice of the penalty of the splines. A 2-nd derivative penalty penalizes the curvature of the spline providing linear extrapolations (slope remains unchanged from the last boundary of training data). A 1-st derivative penalty will produce flat extrapolations so the mean remains unchanged from the last boundary of training data.
+
+
+```{r echo=FALSE}
+plot_predictions(time_smooth, by = 'time',
+                 newdata = datagrid(time = 1:max(data_test$time)),
+                 type = 'link') +
+  geom_vline(xintercept = max(data_train$time), 
+             linetype = 'dashed')
+```
+```{r include=FALSE}
+fixed_mintemp1 <- mvgam(count ~ s(time, bs = 'bs', k = 15, m = 1)+
+                       mintemp,
+                     family = poisson(),
+                     data = data_train,
+                     newdata = data_test)
+```
+```{r include=FALSE}
+df <- as.data.frame(model_data)
+df <- na.omit(df)
+```
+
+
+```{r echo=FALSE}
+plot_predictions(fixed_mintemp1, by = 'time',
+                 newdata = datagrid(time = 1:max(data_test$time)),
+                 type = 'link') +
+  geom_vline(xintercept = max(data_train$time), 
+             linetype = 'dashed') 
+```
+
+Other than that, spline extrapolation is also highly sensitive to wiggliness. 
+In order to model and capture autocorrelation in a series, one thing to do can be to let the spline wiggle more.
+An increased complexity (wiggliness) leads to more accurate inferences on historical patterns, giving more precise intervals and so on, but from a forecasting point of view they still tend to be highly unpredictable given that each spline only have local knowledge about what's inside its interval. 
+
+For forecasting we need global understanding of the phenomenon.
+So we replace spline of time with an actual time series process that can learn from the behaviour of the past and give better predictions into the future.
+There is a variety of processes that can be used inside 'mvgam' as autoregressive processes, Gaussian procesess, random walks, var processes for multivariate time series.
+
+## (BAYESIAN) DYNAMIC GENERALIZED ADDITIVE MODELS
+DGAMs are particularly suited for time series data as they account for temporal dependencies by modelling the series as a dynamic autocorrelated process.
+In the univariate case, a DGAM for discrete time series is specified as follows
+$$
+E(Y_t|X_t) = g^{-1} (\beta_0 + \sum_{i=1}^{I} s_{i,t}(x_{i,t})+z_t)
+$$
+$$
+z_t = \phi_0 + z_{t-1} + e_t
+$$
+where $z_t$ is the latent dynamic proess estimate at time t. 
+As highlighted by *Clark, Wells (2022)*, separating the temporal process from the observation process offers several advantages. It reduces the impact of measurement errors or outliers, which can heavily distort the estimation of AR parameters. Additionally, using latent processes makes it easier to manage missing or irregularly sampled data, providing a more robust and flexible modeling approach: since the $z_t$ are unobserved latent random variables, they will evolve in time even when an observation $Y_t$ is missing.
+
+\[
+\text{count}_t \sim \text{Poisson}(\lambda_t)
+\]
+
+\[
+\log(\lambda_t) = \beta_0 + s(\text{ndvi})_t + s(\text{mintemp})_t + z_t
+\]
+
+\[
+z_t \sim \text{Normal}(z_{t-1}, \sigma_{\text{error}})
+\]
+
+\[
+\sigma_{\text{error}} \sim \text{Exponential}(2)
+\]
+
+\[
+s(\text{ndvi})_t = \sum_{k=1}^{K} b_k(\text{ndvi}_t) \cdot \beta_{\text{smooth}}
+\]
+
+\[
+\beta_{\text{smooth}} \sim \text{MVNormal}(0, (S \cdot \lambda)^{-1})
+\]
+
+\[
+\beta_{\text{mintemp}} \sim \text{Normal}(0, 1)
+\]
+
+\[
+\beta_0 \sim \text{Normal}(0, 1)
+\]
+
+
+
+```{r}
+mod_notime2 <- mvgam(count ~ s(mintemp, bs = 'bs', k = 15) + s(ndvi, bs = 'bs', k = 8),
+                    family = poisson(),
+                    data = data_train,
+                    newdata = data_test,
+                    trend_model = AR(p = 1),
+                    chains = 4, 
+                    samples = 2000, 
+                    burnin = 1000,
+                    noncentred = TRUE)
+```
+```{r}
+code(mod_notime2)
+```
+
+The number $k$ in the 'mvgam' function should be chosen by the user based on the assumed - possibly nonlinear - relationships in the data. However, in order to check whether the assumed complexity is enough or too much, we can look at the *Effective Degrees of Freedom (edf)* and the *Reference Degrees of Freedom (Red.df)*. The first one tells us how complex the smooth term is in practice (the lareger the edf, the more complex the smooth is), while the second one represent the maximum possible degrees of freedom allowed for the smooth term, based on the number of basis function the user chose when setting up the model.
+As we can see here, the smooth term of 'mintemp' has an edf of 6.62 which is more than half of the corresponding Ref.df. The same goes for the smooth of ndvi with an edf of 3. Bear in mind that an edf close to 1 implies an almost linear relationship. 
+
+```{r}
+summary(mod_notime2)
+```
+
+In order to check for discrepancies in the model adequacy to the data, a posterior predictive check can be ran. Notice the slight but systematic deviations of the observed data with respect to the generated data.
+```{r}
+pp_check(mod_notime2, ndraws = 30)
+```
+
+The code below performs a posterior predictive check by comparing the empirical CDF of the observed data against the empirical CDFs of simultaed data generated from the posterior distribution of the model. If the model fits well, the ECDF of the observed data should align closely with the ECDFs of the simulated data.
+```{r}
+pp_check(mod_notime2, type = 'ecdf_overlay')
+```
+
+The residuals of this model don't show evident pattern in the autocorrelation plot.
+```{r}
+plot(mod_notime2, type = "residuals")
+```
+
+ Also the forecasts on the left out sample look good.
+```{r}
+plot(mod_notime2, type = "forecast")
+```
+Now two other models will be fit: 
+- Dynamic GLM with just an intercept in the observation model 
+- Dynamic GLM with interaction between ndvi and mintemp in the observation model.
+
+\[
+\text{count}_t \sim \text{Poisson}(\lambda_t)
+\]
+
+\[
+\log(\lambda_t) = \beta_0 + z_t
+\]
+
+\[
+z_t \sim \text{Normal}(z_{t-1}, \sigma_{\text{error}})
+\]
+
+\[
+\sigma_{\text{error}} \sim \text{Exponential}(2)
+\]
+
+\[
+\beta_0 \sim \text{Normal}(0, 1)
+\]
+```{r}
+mod_notime3 <- mvgam(count ~ 1,
+                    family = poisson(),
+                    data = data_train,
+                    newdata = data_test,
+                    trend_model = AR(p = 1),
+                    chains = 4, 
+                    samples = 2000, 
+                    burnin = 1000,
+                    noncentred = TRUE)
+```
+
+\[
+\text{count}_t \sim \text{Poisson}(\lambda_t)
+\]
+
+\[
+\log(\lambda_t) = \beta_0 + \beta_{\text{ndvi}} \cdot \text{ndvi}_t + \beta_{\text{mintemp}} \cdot \text{mintemp}_t + z_t
+\]
+
+\[
+z_t \sim \text{Normal}(z_{t-1}, \sigma_{\text{error}})
+\]
+
+\[
+\sigma_{\text{error}} \sim \text{Exponential}(2)
+\]
+
+\[
+\beta_0 \sim \text{Normal}(0, 1)
+\]
+
+\[
+\beta_{\text{ndvi}} \sim \text{Normal}(0, 1)
+\]
+
+\[
+\beta_{\text{mintemp}} \sim \text{Normal}(0, 1)
+\]
+```{r}
+mod_notime4 <- mvgam(count ~ mintemp + ndvi,
+                    family = poisson(),
+                    data = data_train,
+                    newdata = data_test,
+                    trend_model = AR(p = 1),
+                    chains = 4, 
+                    samples = 2000, 
+                    burnin = 1000,
+                    noncentred = TRUE)
+```
+
+# MODEL COMPARISON
+The step of model comparison is fundamental for assessing which statistical model is more appropriate for the available data. One popular *information criterion* is the *Deviance Information Criterion (DIC)* which however has been addressed for not being *fully* Bayesian because it uses posterior means (point estimates) instead of the entire posterior distributions available after MCMC simulation.
+Another very used information criterion which instead uses every single one of MCMC samples and observations is the *Watanabe-Akaike Information Criterion (WAIC)*. It uses the log-pointwise predictive density as a raw measure of goodness of fit, which can be computed in practice averaging the likelihood for each observation over all MCMC samples and then summing it up over all *n* observations
+$$
+\sum_{i = 1}^{n}log\Big( \frac{1}{S}\sum_{s=1}^{S}p(y_i|\theta^s \Big)
+$$
+and a penalty on the effective number of parameters which sums for each data point the variance of the log-likelihood across MCMC samples. 
+
+```{r}
+loo_compare(mod_notime2, mod_notime3, mod_notime4)
+```
+Model with smooths on covariate and model with fixed effects on covariates are comparable in terms of performance on the available data.
+
+We would also want to compare models with respect to their predictive capabilities. One proper scoring rule for this evaluation is the Continuous Rank Probability Score (CRPS), which is similar to a weighted absolute error using the full forecast distribution.
+
+```{r}
+fc2 <- forecast(mod_notime2)
+fc3 <- forecast(mod_notime3)
+fc4 <- forecast(mod_notime4)
+```
+
+```{r}
+s2 <- score(fc2, score = "crps")
+s3 <- score(fc3, score = "crps")
+s4 <- score(fc4, score = "crps")
+sum(s2$PP$score, na.rm = TRUE) - sum(s3$PP$score, na.rm = TRUE) # model 2 is preferred
+sum(s2$PP$score, na.rm = TRUE) - sum(s4$PP$score, na.rm = TRUE) # model 2 is preferred
+sum(s3$PP$score, na.rm = TRUE) - sum(s4$PP$score, na.rm = TRUE) # model 4 is preferred
+```
+Model two is preferred in terms of predictive capabilities.
+
+
+
+## POISSON VS NEGATIVE BINOMIAL
+Up to now we have assumed a Poisson distribution for the data, which has the strong assumption of the equivalence between mean and variance. However, since overdispersion (i.e. the empirical evidence that the variance is greater than the mean) is very common when analysing count data in ecological time series, we should also consider to use a Negative Binomial distribution for the data.
+In the context of ecology, a more relevant parametrisation and interpretation of the negative binomial involves expressing the pmf in terms of a location parameter $\mu$ (i.e. mean) and a parameter *k* controlling overdispersion. 
+In particular, if *p* is the probability of success and *r* the number of successes before which we want to count the number of failures then 
+$$
+p = \frac{k}{k+\mu}
+$$
+where $k = r$.
+Then the probability mass function of Y becomes
+$$
+p_Y(y)=\binom{k+y-1}{y} \Big(\frac{\mu}{\mu+k} \Big)^y \Big(\frac{k}{k+\mu}\Big)^k
+$$
+where the variance is a quadratic function of the mean $Var(Y) = \mu + \frac{\mu^2}{k}$ and the Poisson becomes a special case of the Negative Binomial when $k$ grows to infinity.
+This is the parametrisation used by Stan inside 'mvgam' function.
+
+```{r}
+nb_notime2 <- mvgam(count ~ s(mintemp, bs = 'bs', k = 15) + s(ndvi, bs = 'bs', k = 8),
+                    family = nb(),
+                    data = data_train,
+                    newdata = data_test,
+                    trend_model = AR(p = 1),
+                    chains = 4, 
+                    samples = 2000, 
+                    burnin = 1000,
+                    noncentred = TRUE)
+```
+
+```{r}
+code(nb_notime2)
+```
+```{r}
+pp_check(nb_notime2, ndraws = 30)
+```
+```{r}
+pp_check(nb_notime2, type = 'ecdf_overlay')
+```
+
+At one side we have the model with Poisson observations, smooths of covariates and AR1 latent process, at the other side we have the same model but with Negative Binomial observations. In terms of crps, they are paractically equal.
+```{r}
+fc5 <- forecast(nb_notime2)
+s5 <- score(fc5, type = 'crps')
+sum(s2$PP$score, na.rm = TRUE) - sum(s5$PP$score, na.rm = TRUE) 
+```
+
+
+
