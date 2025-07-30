@@ -1,1 +1,1 @@
-# Bayesian-Modelling-Project
+# bayesian_modelling_project
