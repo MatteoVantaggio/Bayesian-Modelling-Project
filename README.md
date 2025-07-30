@@ -25,7 +25,7 @@ The aim of this work is to perform Bayesian inference using **Hamiltonian Monte 
 
 ## View the full report
 
-👉 (https://matteovantaggio.github.io/Bayesian-Modelling-Project/bayesian_modelling_project.html)
+👉 (https://matteovantaggio.github.io/Bayesian-Modelling-Project/)
 
 ---
 
