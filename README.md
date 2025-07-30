@@ -1,4 +1,4 @@
-# bayesian_modelling_project
+# Bayesian Modelling Project
 
 This project was developed for the **Bayesian Modelling** course of the MSc in *Statistical Methods and Applications* at Sapienza University of Rome.
 
