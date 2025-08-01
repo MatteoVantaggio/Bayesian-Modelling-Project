@@ -23,8 +23,7 @@ The aim of this work is to perform Bayesian inference using **Hamiltonian Monte 
 - `bayesian_project.Rmd`: full R Markdown source with code and explanations
 - `bayesian_project.html`: rendered version of the report
 
-## Report Access
-[**View Full Report**](https://matteovantaggio.github.io/Bayesian-Modelling-Project/)
+
 
 ---
 
